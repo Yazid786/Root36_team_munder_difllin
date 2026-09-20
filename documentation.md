@@ -27,7 +27,7 @@ Process Mafia combines a Linux/process theme with hidden roles, room-based tasks
 
 ## Overview
 
-**Process Mafia** is a multiplayer social-deduction game inspired by games such as Among Us, but presented as a Linux-style terminal environment.
+**Process Mafia** is a multiplayer social-deduction game inspired by games such as Among Us, but presented as a Linux-style terminal environment and also this can only used in a debian based terminal.
 
 Each player is represented as a computer process. Some processes belong to the good team, while others are malware attempting to compromise the system.
 
