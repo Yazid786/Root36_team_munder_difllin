@@ -334,9 +334,21 @@ def kill_get_key(timeout):
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-        ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        if ready:
-            return sys.stdin.read(1)
+
+        # Stay in the SAME process as the client.  This avoids a second
+        # Python process competing for the VS Code terminal's stdin.
+        end_time = time.time() + timeout
+
+        while time.time() < end_time:
+            if minigame_cancelled:
+                return None
+
+            remaining = max(0.0, end_time - time.time())
+            ready, _, _ = select.select([sys.stdin], [], [], min(0.05, remaining))
+
+            if ready:
+                return sys.stdin.read(1)
+
         return None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -514,6 +526,11 @@ client_alive = True
 
 # Active minigame subprocess
 active_minigame_process = None
+
+# Set immediately when the kill minigame takes ownership of stdin.
+# This prevents client_game_loop() from competing with the minigame
+# for keyboard input in the VS Code terminal.
+kill_minigame_active = threading.Event()
 
 # Set when the server/client state forces the current minigame to stop.
 # This prevents an interrupted minigame thread from sending a stale result.
@@ -3022,14 +3039,23 @@ def log_event(msg):
 
 
 def stop_active_minigame(reason=""):
-    """Stop the current minigame immediately and return control to the HUD."""
+    """Cancel the current minigame and return control to the HUD."""
     global active_minigame_process, minigame_cancelled, ui_dirty
+
+    minigame_cancelled = True
+
+    # Kill minigame now runs in a thread in this same process.
+    # kill_get_key() checks this flag while waiting for the key.
+    if kill_minigame_active.is_set():
+        kill_minigame_active.clear()
+        ui_dirty = True
+        if reason:
+            log_event(f"{YELLOW}[!] {reason} Minigame stopped.{RESET}")
+        return True
 
     proc = active_minigame_process
     if proc is None:
         return False
-
-    minigame_cancelled = True
 
     try:
         if proc.poll() is None:
@@ -3478,10 +3504,15 @@ def handle_server_message(message, conn=None):
     elif message_type == "KillMinigame":
         target_name = message.get("Target", "")
 
-        def run_kill():
-            global active_minigame_process, minigame_cancelled
+        # The kill minigame runs in this client process, in its own thread.
+        # The main HUD loop is prevented from reading stdin while this event
+        # is set, so the minigame has exclusive terminal input.
+        minigame_cancelled = False
+        kill_minigame_active.set()
 
-            minigame_cancelled = False
+        def run_kill():
+            global minigame_cancelled, ui_dirty
+
             clear_terminal()
             print(
                 f"{RED}--- Attempting to kill {target_name} ---{RESET}\n",
@@ -3491,29 +3522,17 @@ def handle_server_message(message, conn=None):
             success = False
 
             try:
-                cmd = (
-                    "from test import play_kill_minigame; "
-                    "import sys; "
-                    "sys.exit(0 if play_kill_minigame() else 1)"
-                )
-
-                proc = subprocess.Popen(
-                    ["python3", "-c", cmd]
-                )
-                active_minigame_process = proc
-
-                proc.wait()
-                success = proc.returncode == 0
+                # No subprocess and no `from test import ...`.
+                # The function already exists in this client process.
+                success = play_kill_minigame()
 
             except Exception as e:
-                print(f"Kill minigame error: {e}")
+                print(f"Kill minigame error: {e}", flush=True)
                 success = False
 
             finally:
-                active_minigame_process = None
+                kill_minigame_active.clear()
 
-            # If a death/game-over/other server event interrupted the kill,
-            # never report the old minigame result.
             was_cancelled = minigame_cancelled
             ui_dirty = True
 
@@ -3544,7 +3563,7 @@ def handle_server_message(message, conn=None):
         if player_name == client_name:
             client_alive = False
 
-            if active_minigame_process is not None:
+            if active_minigame_process is not None or kill_minigame_active.is_set():
                 stop_active_minigame("You died.")
 
             log_event(
@@ -3641,11 +3660,11 @@ def handle_server_message(message, conn=None):
 
         if eliminated == client_name:
             client_alive = False
-            if active_minigame_process is not None:
+            if active_minigame_process is not None or kill_minigame_active.is_set():
                 stop_active_minigame("You were eliminated.")
 
     elif message_type == "GameOver":
-        if active_minigame_process is not None:
+        if active_minigame_process is not None or kill_minigame_active.is_set():
             stop_active_minigame("Game over.")
 
         ui_phase = "GameOver"
@@ -3726,13 +3745,20 @@ def client_game_loop(conn):
 
         message = ""
         while True:
+            # A kill minigame owns terminal stdin.  Do not even call
+            # select() here while it is active, otherwise the parent client
+            # can consume the key intended for the minigame.
+            if kill_minigame_active.is_set():
+                time.sleep(0.05)
+                continue
+
             if active_minigame_process is not None:
-                while active_minigame_process is not None:
+                while active_minigame_process is not None or kill_minigame_active.is_set():
                     time.sleep(0.1)
                 
                 ui_dirty = True
                 
-            if ui_dirty and active_minigame_process is None:
+            if ui_dirty and active_minigame_process is None and not kill_minigame_active.is_set():
                 draw_hud()
                 ui_dirty = False
 
