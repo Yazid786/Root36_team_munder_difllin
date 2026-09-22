@@ -796,7 +796,6 @@ def assign_roles():
             "Role": roles[i],
         })
 
-    print(f"[SERVER] Roles assigned: {dict(zip(player_ids, roles))}")
 
 
 # ============================================================
@@ -1057,8 +1056,6 @@ def handle_task_result(player_id, message):
             "Remaining": remaining,
         })
 
-        print(f"[SERVER] {name} completed task in {room}. "
-              f"{completed_count}/{TASKS_PER_DAY} done.")
 
     # Check if all tasks are done for early day end
     if check_all_tasks_complete():
@@ -1240,7 +1237,6 @@ def handle_kill_result(player_id, message):
         "Message": f"You killed {target_name}."
     })
 
-    print(f"[SERVER] {target_name} was killed by {player['Name']}.")
 
     # Check win condition after death
     winner = check_win_conditions()
@@ -1426,7 +1422,6 @@ def handle_revive(player_id, message):
         "Message": f"You revived {target_name}."
     })
 
-    print(f"[SERVER] {target_name} was revived by {player['Name']}.")
 
     # Check win condition after revival
     winner = check_win_conditions()
@@ -1699,7 +1694,6 @@ def handle_sabotage(player_id, message):
         ),
     })
 
-    print(f"[SERVER] {player['Name']} sabotaged {target_name}.")
 
 
 # ============================================================
@@ -1770,7 +1764,6 @@ def handle_vote(player_id, message):
         "Message": f"{name} has voted."
     })
 
-    print(f"[SERVER] {name} voted for {target_name}.")
 
     # Check if all alive players have voted for early end
     alive_players = get_alive_players()
@@ -1871,7 +1864,6 @@ def announce_winner(winner):
         "Roles": role_text,
     })
 
-    print(f"[SERVER] GAME OVER — {winner} team wins!")
 
 
 # ============================================================
@@ -1940,7 +1932,6 @@ def run_game_loop():
         # Assign tasks
         assign_tasks_for_day()
 
-        print(f"[SERVER] === DAY {day_number} === ({DAY_DURATION}s)")
 
         # Wait for day to end (timer or all tasks complete)
         day_early_end.wait(timeout=DAY_DURATION)
@@ -1992,11 +1983,6 @@ def run_game_loop():
             "DayNumber": day_number,
             "Duration": DISCUSSION_DURATION,
         })
-
-        print(
-            f"[SERVER] === DISCUSSION === ({DISCUSSION_DURATION}s)"
-        )
-
         time.sleep(DISCUSSION_DURATION)
 
         if current_phase == "GameOver":
@@ -2015,8 +2001,6 @@ def run_game_loop():
             "DayNumber": day_number,
             "Duration": VOTING_DURATION,
         })
-
-        print(f"[SERVER] === VOTING === ({VOTING_DURATION}s)")
 
         time.sleep(VOTING_DURATION)
 
@@ -2046,9 +2030,6 @@ def run_game_loop():
                 ),
             })
 
-            print(
-                f"[SERVER] {eliminated_name} was voted out."
-            )
             
             # Check for Jester win condition
             if target and target.get("Role") == "Jester":
@@ -2069,9 +2050,7 @@ def run_game_loop():
                 "Message": "No consensus reached. Nobody was eliminated.",
             })
 
-            print("[SERVER] No elimination — tied vote.")
 
-    print(f"[SERVER] Game loop ended. Returning to lobby in {GAME_OVER_DELAY} seconds.")
     time.sleep(GAME_OVER_DELAY)
     
     with lock:
@@ -2108,8 +2087,7 @@ def run_game_loop():
         "Player": "SYSTEM",
         "Message": "The lobby has been reset for a new game. Type /start or start game to begin!"
     })
-    
-    print("[SERVER] Game state reset to Lobby.")
+
 
 
 # ============================================================
@@ -2127,6 +2105,18 @@ def process_message(player_id, message):
     name = player["Name"]
 
     message_type = message.get("Type")
+
+    # Dead players must not be allowed to send gameplay commands.
+    # Reject them here, before any command-specific handler runs.
+    # This prevents a dead client from entering movement, task, voting,
+    # role-action, or other handlers that can affect the running game.
+    if not player.get("Alive", True):
+        if message_type != "Chat":
+            send_to_player(player_id, {
+                "Type": "Error",
+                "Message": "You are dead and cannot use game commands."
+            })
+        return
 
     # --------------------------------------------------------
     # START GAME
@@ -2410,8 +2400,6 @@ def handle_player(conn, addr):
         )
 
 
-        print()
-        print(f"{name} connected from {addr}")
 
         # Send the assigned name to the client
         send_message(conn, {
@@ -2452,12 +2440,6 @@ def handle_player(conn, addr):
 
             if message is None:
                 break
-
-
-            print(
-                f"{name} -> {message}"
-            )
-
 
             process_message(
                 player_id,
@@ -3243,15 +3225,6 @@ def handle_server_message(message, conn=None):
     message_type = message.get("Type")
     redraw = True
 
-    # A server event means the game state changed. If a minigame is running,
-    # immediately stop it so the minigame can never keep the terminal after
-    # a death, game over, phase change, disconnect, etc.
-    # The main client loop will redraw the normal boxed HUD afterwards.
-    if active_minigame_process is not None:
-        stop_active_minigame(
-            f"Server event ({message_type}) received."
-        )
-
     if message_type == "YourName":
         global client_name
         client_name = message.get("Name", client_name)
@@ -3570,6 +3543,10 @@ def handle_server_message(message, conn=None):
 
         if player_name == client_name:
             client_alive = False
+
+            if active_minigame_process is not None:
+                stop_active_minigame("You died.")
+
             log_event(
                 f"{RED}{BOLD}YOU ARE DEAD! Your process was terminated.{RESET}"
             )
@@ -3662,7 +3639,15 @@ def handle_server_message(message, conn=None):
         if eliminated in ui_players:
             ui_players[eliminated]["Alive"] = False
 
+        if eliminated == client_name:
+            client_alive = False
+            if active_minigame_process is not None:
+                stop_active_minigame("You were eliminated.")
+
     elif message_type == "GameOver":
+        if active_minigame_process is not None:
+            stop_active_minigame("Game over.")
+
         ui_phase = "GameOver"
         msg = message.get("Message", "")
         roles = message.get("Roles", "")
