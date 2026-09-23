@@ -531,6 +531,7 @@ ui_current_room = "Lobby"
 ui_room_players = None # last known room occupants; None means not checked yet
 ui_tasks = []        # list of dicts: {"room": str, "completed": bool}
 ui_chat_log = []     # list of strings
+ui_chat_messages = [] # public chat messages only
 ui_audit_leaks = []  # leaked audit log entries for the current discussion
 ui_phase = "Lobby"
 ui_day_num = 0
@@ -1223,13 +1224,6 @@ def handle_kill_result(player_id, message):
             return
 
         target["Alive"] = False
-
-        # Immediately notify the player who was killed.
-        send_to_player(target_id, {
-            "Type": "Death",
-            "Player": target_name,
-            "Message": "You were killed. Your process was terminated."
-        })
 
     with game_lock:
         recently_dead.append(target_id)
@@ -2028,13 +2022,6 @@ def run_game_loop():
                 if target is not None:
                     target["Alive"] = False
 
-            # Immediately notify the player who was voted out.
-            send_to_player(eliminated_id, {
-                "Type": "Death",
-                "Player": eliminated_name,
-                "Message": "You were voted out. Your process was terminated."
-            })
-
             with game_lock:
                 recently_dead.append(eliminated_id)
 
@@ -2730,7 +2717,7 @@ def host_game(name):
     # Initialize the host's local UI state just like a normal client.
     global client_role, client_alive
     global ui_players, ui_current_room, ui_room_players
-    global ui_tasks, ui_chat_log, ui_phase, ui_day_num, hud_scroll
+    global ui_tasks, ui_chat_log, ui_chat_messages, ui_phase, ui_day_num, hud_scroll
 
     client_role = None
     client_alive = True
@@ -2739,6 +2726,7 @@ def host_game(name):
     ui_room_players = None
     ui_tasks = []
     ui_chat_log = []
+    ui_chat_messages = []
     ui_audit_leaks = []
     ui_phase = "Lobby"
     ui_day_num = 0
@@ -3190,6 +3178,21 @@ def _draw_hud_full():
         print(mid)
 
         # --------------------------------------------------------
+        # CHAT
+        # --------------------------------------------------------
+        print(section_header("CHAT"))
+
+        if not ui_chat_messages:
+            print(box_line("   No chat messages yet."))
+        else:
+            for raw_msg in ui_chat_messages[-8:]:
+                clean_msg = strip_ansi(raw_msg).strip()
+                if clean_msg:
+                    print_wrapped_box(clean_msg, indent="   ")
+
+        print(mid)
+
+        # --------------------------------------------------------
         # CHAT / EVENTS
         # --------------------------------------------------------
         print(section_header("RECENT ACTIVITY"))
@@ -3424,7 +3427,11 @@ def handle_server_message(message, conn=None):
 
                 log_event(f"{CYAN}[EVENT] {line}{RESET}")
         else:
-            log_event(f"{BOLD}{player} ›{RESET} {msg}")
+            chat_line = f"{BOLD}{player} ›{RESET} {msg}"
+            ui_chat_messages.append(chat_line)
+            if len(ui_chat_messages) > 20:
+                del ui_chat_messages[:-20]
+            # Chat messages are shown only in the dedicated CHAT section.
 
     elif message_type == "Whisper":
         player = message.get("Player", "")
@@ -4219,7 +4226,7 @@ def client_game(conn, name):
     global client_conn, client_name
     global client_role, client_alive
     global ui_players, ui_current_room, ui_room_players
-    global ui_tasks, ui_chat_log, ui_phase, ui_day_num, hud_scroll
+    global ui_tasks, ui_chat_log, ui_chat_messages, ui_phase, ui_day_num, hud_scroll
 
     client_conn = conn
     client_name = name
@@ -4232,6 +4239,7 @@ def client_game(conn, name):
     ui_room_players = None
     ui_tasks = []
     ui_chat_log = []
+    ui_chat_messages = []
     ui_phase = "Lobby"
     ui_day_num = 0
     hud_scroll = 0
