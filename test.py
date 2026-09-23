@@ -10,6 +10,9 @@ from datetime import datetime
 import termios
 import tty
 import os
+import io
+import contextlib
+import shutil
 import termios
 import tty
 
@@ -334,21 +337,9 @@ def kill_get_key(timeout):
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-
-        # Stay in the SAME process as the client.  This avoids a second
-        # Python process competing for the VS Code terminal's stdin.
-        end_time = time.time() + timeout
-
-        while time.time() < end_time:
-            if minigame_cancelled:
-                return None
-
-            remaining = max(0.0, end_time - time.time())
-            ready, _, _ = select.select([sys.stdin], [], [], min(0.05, remaining))
-
-            if ready:
-                return sys.stdin.read(1)
-
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if ready:
+            return sys.stdin.read(1)
         return None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -419,7 +410,7 @@ DAY_DURATION = 180        # seconds
 NIGHT_DURATION = 30       # seconds
 DISCUSSION_DURATION = 60  # seconds
 VOTING_DURATION = 30      # seconds
-GAME_OVER_DELAY = 2       # seconds before returning to the lobby
+GAME_OVER_DELAY = 5       # seconds before returning to the lobby
 TASKS_PER_DAY = 2
 MAX_SABOTAGES = 2
 MAX_ROOTKIT_USES = 2
@@ -526,11 +517,6 @@ client_alive = True
 
 # Active minigame subprocess
 active_minigame_process = None
-
-# Set immediately when the kill minigame takes ownership of stdin.
-# This prevents client_game_loop() from competing with the minigame
-# for keyboard input in the VS Code terminal.
-kill_minigame_active = threading.Event()
 
 # Set when the server/client state forces the current minigame to stop.
 # This prevents an interrupted minigame thread from sending a stale result.
@@ -788,8 +774,8 @@ def assign_roles():
 
     roles = ["Virus", "System Admin"]
 
-    if num_players >= 7:
-        roles.extend(["Rootkit"])
+    if num_players >= 5:
+        roles.extend(["Rootkit", "Antivirus"])
 
     # Fill remaining with Process
     while len(roles) < num_players:
@@ -799,10 +785,7 @@ def assign_roles():
     if num_players >= 5 and random.random() < 0.5:
         if "Process" in roles:
             roles.remove("Process")
-            if random.random() < 0.5:
-                roles.append("Jester")
-            else:
-                roles.append("Antivirus")
+            roles.append("Jester")
 
     # Assign roles
     for i, pid in enumerate(player_ids):
@@ -1240,6 +1223,13 @@ def handle_kill_result(player_id, message):
             return
 
         target["Alive"] = False
+
+        # Immediately notify the player who was killed.
+        send_to_player(target_id, {
+            "Type": "Death",
+            "Player": target_name,
+            "Message": "You were killed. Your process was terminated."
+        })
 
     with game_lock:
         recently_dead.append(target_id)
@@ -1796,56 +1786,37 @@ def handle_vote(player_id, message):
 
 def tally_votes():
     """
-    Count votes.
-
-    Players who did not vote are automatically counted as SKIP.
-
-    Returns:
-        (eliminated_name, eliminated_id)
-        or
-        (None, None) if Skip wins or there is a tie.
+    Count votes and determine elimination.
+    Returns (eliminated_name, eliminated_id) or (None, None) on tie.
     """
 
-    # Get all alive players
-    alive_players = get_alive_players()
+    if not votes:
+        return None, None
 
-    # Count votes
+    # Count votes per target
     vote_counts = {}
 
     for voter_id, target_name in votes.items():
         vote_counts[target_name] = vote_counts.get(target_name, 0) + 1
 
-    # Players who did not vote = SKIP
-    for player_id, player in alive_players:
-        if player_id not in votes:
-            vote_counts["SKIP"] = vote_counts.get("SKIP", 0) + 1
-
-    # Safety check
-    if not vote_counts:
-        return None, None
-
-    # Find highest vote count
+    # Find maximum votes
     max_votes = max(vote_counts.values())
 
+    # Check for tie
     top_targets = [
-        name
-        for name, count in vote_counts.items()
+        name for name, count in vote_counts.items()
         if count == max_votes
     ]
 
-    # Tie
     if len(top_targets) > 1:
+        # Tie — no elimination
         return None, None
 
-    # Skip received the most votes
-    if top_targets[0] == "SKIP":
-        return None, None
-
-    # A player received the most votes
     eliminated_name = top_targets[0]
     eliminated_id = find_player_id_by_name(eliminated_name)
 
     return eliminated_name, eliminated_id
+
 
 # ============================================================
 # WIN CONDITIONS
@@ -2056,6 +2027,13 @@ def run_game_loop():
 
                 if target is not None:
                     target["Alive"] = False
+
+            # Immediately notify the player who was voted out.
+            send_to_player(eliminated_id, {
+                "Type": "Death",
+                "Player": eliminated_name,
+                "Message": "You were voted out. Your process was terminated."
+            })
 
             with game_lock:
                 recently_dead.append(eliminated_id)
@@ -2752,7 +2730,7 @@ def host_game(name):
     # Initialize the host's local UI state just like a normal client.
     global client_role, client_alive
     global ui_players, ui_current_room, ui_room_players
-    global ui_tasks, ui_chat_log, ui_phase, ui_day_num
+    global ui_tasks, ui_chat_log, ui_phase, ui_day_num, hud_scroll
 
     client_role = None
     client_alive = True
@@ -2764,6 +2742,7 @@ def host_game(name):
     ui_audit_leaks = []
     ui_phase = "Lobby"
     ui_day_num = 0
+    hud_scroll = 0
 
     client_game_loop(
         host_connection
@@ -2913,8 +2892,11 @@ YELLOW = "\033[93m"
 ui_draw_lock = threading.RLock()
 ui_dirty = True
 
+# Whole-HUD scroll position. 0 means newest content.
+hud_scroll = 0
+
 # Keep the HUD compact enough for normal laptop terminals.
-HUD_WIDTH = 78
+HUD_WIDTH = 90
 
 # ANSI escape sequence for a real redraw rather than appending output.
 CLEAR_SCREEN = "\033[2J\033[H"
@@ -3061,23 +3043,14 @@ def log_event(msg):
 
 
 def stop_active_minigame(reason=""):
-    """Cancel the current minigame and return control to the HUD."""
+    """Stop the current minigame immediately and return control to the HUD."""
     global active_minigame_process, minigame_cancelled, ui_dirty
-
-    minigame_cancelled = True
-
-    # Kill minigame now runs in a thread in this same process.
-    # kill_get_key() checks this flag while waiting for the key.
-    if kill_minigame_active.is_set():
-        kill_minigame_active.clear()
-        ui_dirty = True
-        if reason:
-            log_event(f"{YELLOW}[!] {reason} Minigame stopped.{RESET}")
-        return True
 
     proc = active_minigame_process
     if proc is None:
         return False
+
+    minigame_cancelled = True
 
     try:
         if proc.poll() is None:
@@ -3099,7 +3072,7 @@ def stop_active_minigame(reason=""):
     return True
 
 
-def draw_hud():
+def _draw_hud_full():
     """
     Render the ENTIRE HUD.
 
@@ -3249,6 +3222,60 @@ def draw_hud():
         print(f"{CYAN}> {RESET}", end="", flush=True)
 
 
+def draw_hud(input_buffer=""):
+    """Render the complete HUD with whole-card scrolling."""
+    global hud_scroll
+
+    if active_minigame_process is not None:
+        return
+
+    # Reuse the existing renderer and capture its complete frame.
+    # This lets the entire HUD scroll without duplicating its sections.
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        _draw_hud_full()
+
+    rendered = buffer.getvalue().replace(CLEAR_SCREEN, "")
+    lines = rendered.splitlines()
+
+    # _draw_hud_full() ends with its command prompt; we draw our own.
+    if lines and strip_ansi(lines[-1]).strip() == ">":
+        lines.pop()
+
+    terminal_height = shutil.get_terminal_size((HUD_WIDTH + 2, 30)).lines
+    visible_height = max(8, terminal_height - 2)
+    max_scroll = max(0, len(lines) - visible_height)
+    hud_scroll = max(0, min(hud_scroll, max_scroll))
+
+    if hud_scroll == 0:
+        start = max(0, len(lines) - visible_height)
+    else:
+        start = max(0, len(lines) - visible_height - hud_scroll)
+
+    visible_lines = lines[start:start + visible_height]
+
+    clear_terminal()
+    for line in visible_lines:
+        print(line)
+
+    if max_scroll > 0:
+        if hud_scroll == 0:
+            indicator = " [HUD: newest | ↑/↓ scroll | PageUp/PageDown]"
+        else:
+            indicator = (
+                f" [HUD: {hud_scroll}/{max_scroll} back | "
+                "↑/↓ scroll | PageUp/PageDown]"
+            )
+    else:
+        indicator = ""
+
+    print(
+        f"{CYAN}> {RESET}{input_buffer}",
+        end="",
+        flush=True
+    )
+
+
 # ============================================================
 # HANDLE SERVER MESSAGE (CLIENT-SIDE)
 # ============================================================
@@ -3268,7 +3295,7 @@ def handle_server_message(message, conn=None):
     global client_role, client_alive
     global ui_phase, ui_day_num, ui_current_room
     global ui_room_players, ui_tasks, ui_players, ui_audit_leaks
-    global active_minigame_process, ui_dirty
+    global active_minigame_process, ui_dirty, hud_scroll
 
     message_type = message.get("Type")
     redraw = True
@@ -3526,15 +3553,10 @@ def handle_server_message(message, conn=None):
     elif message_type == "KillMinigame":
         target_name = message.get("Target", "")
 
-        # The kill minigame runs in this client process, in its own thread.
-        # The main HUD loop is prevented from reading stdin while this event
-        # is set, so the minigame has exclusive terminal input.
-        minigame_cancelled = False
-        kill_minigame_active.set()
-
         def run_kill():
-            global minigame_cancelled, ui_dirty
+            global active_minigame_process, minigame_cancelled
 
+            minigame_cancelled = False
             clear_terminal()
             print(
                 f"{RED}--- Attempting to kill {target_name} ---{RESET}\n",
@@ -3544,17 +3566,29 @@ def handle_server_message(message, conn=None):
             success = False
 
             try:
-                # No subprocess and no `from test import ...`.
-                # The function already exists in this client process.
-                success = play_kill_minigame()
+                cmd = (
+                    "from test import play_kill_minigame; "
+                    "import sys; "
+                    "sys.exit(0 if play_kill_minigame() else 1)"
+                )
+
+                proc = subprocess.Popen(
+                    ["python3", "-c", cmd]
+                )
+                active_minigame_process = proc
+
+                proc.wait()
+                success = proc.returncode == 0
 
             except Exception as e:
-                print(f"Kill minigame error: {e}", flush=True)
+                print(f"Kill minigame error: {e}")
                 success = False
 
             finally:
-                kill_minigame_active.clear()
+                active_minigame_process = None
 
+            # If a death/game-over/other server event interrupted the kill,
+            # never report the old minigame result.
             was_cancelled = minigame_cancelled
             ui_dirty = True
 
@@ -3585,7 +3619,7 @@ def handle_server_message(message, conn=None):
         if player_name == client_name:
             client_alive = False
 
-            if active_minigame_process is not None or kill_minigame_active.is_set():
+            if active_minigame_process is not None:
                 stop_active_minigame("You died.")
 
             log_event(
@@ -3682,11 +3716,11 @@ def handle_server_message(message, conn=None):
 
         if eliminated == client_name:
             client_alive = False
-            if active_minigame_process is not None or kill_minigame_active.is_set():
+            if active_minigame_process is not None:
                 stop_active_minigame("You were eliminated.")
 
     elif message_type == "GameOver":
-        if active_minigame_process is not None or kill_minigame_active.is_set():
+        if active_minigame_process is not None:
             stop_active_minigame("Game over.")
 
         ui_phase = "GameOver"
@@ -3705,6 +3739,7 @@ def handle_server_message(message, conn=None):
         redraw = False
 
     if redraw:
+        hud_scroll = 0
         ui_dirty = True
 
 
@@ -3751,349 +3786,428 @@ def send_move_message(conn,message):
 # CLIENT GAME LOOP
 # ============================================================
 
+def _hud_text_input(prompt, fd, old_terminal_settings):
+    """Temporarily restore normal terminal input for commands needing input()."""
+    termios.tcsetattr(fd, termios.TCSADRAIN, old_terminal_settings)
+    try:
+        return input(prompt)
+    finally:
+        tty.setcbreak(fd)
+
+
+def _read_hud_input(fd, input_buffer):
+    """Read one key in cbreak mode and return (action, new_buffer)."""
+    ch = os.read(fd, 1).decode(errors="ignore")
+
+    if ch == "\x1b":
+        seq = ch
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.03)
+            if not ready:
+                break
+            seq += os.read(fd, 1).decode(errors="ignore")
+            if seq in ("\x1b[A", "\x1b[B", "\x1b[5~", "\x1b[6~"):
+                break
+
+        if seq == "\x1b[A":
+            return "scroll_up", input_buffer
+        if seq == "\x1b[B":
+            return "scroll_down", input_buffer
+        if seq == "\x1b[5~":
+            return "page_up", input_buffer
+        if seq == "\x1b[6~":
+            return "page_down", input_buffer
+        return "none", input_buffer
+
+    if ch in ("\r", "\n"):
+        return "enter", input_buffer
+    if ch in ("\x7f", "\b"):
+        return "none", input_buffer[:-1]
+    if ch == "\x03":
+        return "quit", input_buffer
+    if ch.isprintable():
+        return "none", input_buffer + ch
+    return "none", input_buffer
+
+
 def client_game_loop(conn):
+    global ui_dirty, hud_scroll
 
-    global ui_dirty
-
-    # Put the HUD on its own terminal screen so previous HUD frames
-    # can never remain visible underneath the current one.
     enter_hud_screen()
 
-    # Initial draw when loop starts
     draw_hud()
     ui_dirty = False
 
-    while True:
-
-        message = ""
-        while True:
-            # A kill minigame owns terminal stdin.  Do not even call
-            # select() here while it is active, otherwise the parent client
-            # can consume the key intended for the minigame.
-            if kill_minigame_active.is_set():
-                time.sleep(0.05)
-                continue
-
-            if active_minigame_process is not None:
-                while active_minigame_process is not None or kill_minigame_active.is_set():
-                    time.sleep(0.1)
-                
-                ui_dirty = True
-                
-            if ui_dirty and active_minigame_process is None and not kill_minigame_active.is_set():
-                draw_hud()
-                ui_dirty = False
-
-            r, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if r:
-                line = sys.stdin.readline()
-                if not line:
-                    exit_hud_screen()
-                    return # EOF
-                message = line
-                break
-
-        # ====================================================
-        # QUIT
-        # ====================================================
-
-        if message.strip() == "/quit":
-
-            exit_hud_screen()
-            break
-
-
-        # ====================================================
-        # IGNORE EMPTY MESSAGE
-        # ====================================================
-
-        if message.strip() == "":
-            ui_dirty = True
-            continue
-
-        message = message.strip()
-
-
-        # ====================================================
-        # VOTE
-        # ====================================================
-
-        if message.startswith("/vote"):
-
-            parts = message.split(maxsplit=1)
-
-            if len(parts) < 2:
-                target_name = input(
-                    "Enter player name to vote for: "
-                ).strip()
-            else:
-                target_name = parts[1].strip()
-
-            send_message(conn, {
-                "Type": "Vote",
-                "Target": target_name,
-            })
-
-
-        # ====================================================
-        # WHISPER
-        # ====================================================
-
-        elif message == "/whisper":
-            target_name = input(
-                "Enter the player name: "
-            ).strip()
-
-            whisper_message = input(
-                f">(Whisper to {target_name}) "
-            )
-
-            send_whisper(
-                conn,
-                whisper_message,
-                target_name
-            )
-
-        elif message.startswith("/tamperedit"):
-            parts = message.split(maxsplit=3)
-            if len(parts) >= 4:
-                target = parts[1]
-                try:
-                    index = int(parts[2]) - 1
-                    new_room = parts[3]
-                    send_message(conn, {
-                        "Type": "TamperAction",
-                        "Action": "edit",
-                        "Target": target,
-                        "Index": index,
-                        "NewRoom": new_room,
-                    })
-                except ValueError:
-                    print("Invalid index.")
-            else:
-                print("Usage: /tamperedit <target> <index> <new_room>")
-
-        elif message.startswith("/tamperadd"):
-            parts = message.split(maxsplit=3)
-            if len(parts) >= 4:
-                target = parts[1]
-                new_room = parts[2]
-                timestamp = parts[3]
-                send_message(conn, {
-                    "Type": "TamperAction",
-                    "Action": "add",
-                    "Target": target,
-                    "Room": new_room,
-                    "Timestamp": timestamp,
-                })
-            else:
-                print("Usage: /tamperadd <target> <room> <HH:MM:SS>")
-
-        # ====================================================
-        # ROOM MOVEMENT
-        # ====================================================
-
-        elif message == "/move":
-            room_name = input(
-                "Enter the folder you want to move into: "
-            ).strip()
-
-            send_move_message(
-                conn,
-                room_name
-            )
-
-
-        # ====================================================
-        # TASK
-        # ====================================================
-
-        elif message == "/task":
-
-            send_message(conn, {
-                "Type": "TaskRequest",
-            })
-
-
-        # ====================================================
-        # LS (Room Info)
-        # ====================================================
-
-        elif message == "/ls":
-
-            send_message(conn, {
-                "Type": "Ls",
-            })
-
-
-        # ====================================================
-        # VIEW TASKS
-        # ====================================================
-
-        elif message == "/tasks":
-
-            send_message(conn, {
-                "Type": "ViewTasks",
-            })
-
-
-        # ====================================================
-        # KILL (Virus)
-        # ====================================================
-
-        elif message.startswith("/kill"):
-
-            parts = message.split(maxsplit=1)
-
-            if len(parts) < 2:
-                target_name = input(
-                    "Enter target name: "
-                ).strip()
-            else:
-                target_name = parts[1].strip()
-
-            send_message(conn, {
-                "Type": "Kill",
-                "Target": target_name,
-            })
-
-
-        # ====================================================
-        # INSPECT (System Admin)
-        # ====================================================
-
-        elif message.startswith("/inspect"):
-
-            parts = message.split(maxsplit=1)
-
-            if len(parts) < 2:
-                target_name = input(
-                    "Enter player name to inspect: "
-                ).strip()
-            else:
-                target_name = parts[1].strip()
-
-            send_message(conn, {
-                "Type": "Inspect",
-                "Target": target_name,
-            })
-
-
-        # ====================================================
-        # REVIVE (Antivirus)
-        # ====================================================
-
-        elif message.startswith("/revive"):
-
-            parts = message.split(maxsplit=1)
-
-            if len(parts) < 2:
-                target_name = input(
-                    "Enter player name to revive: "
-                ).strip()
-            else:
-                target_name = parts[1].strip()
-
-            send_message(conn, {
-                "Type": "Revive",
-                "Target": target_name,
-            })
-
-
-        # ====================================================
-        # TAMPER (Rootkit)
-        # ====================================================
-
-        elif message.startswith("/tamper"):
-
-            parts = message.split(maxsplit=1)
-
-            if len(parts) < 2:
-                target_name = input(
-                    "Enter player name to tamper: "
-                ).strip()
-            else:
-                target_name = parts[1].strip()
-
-            send_message(conn, {
-                "Type": "Tamper",
-                "Target": target_name,
-            })
-
-
-        # ====================================================
-        # SABOTAGE (Bad team)
-        # ====================================================
-
-        elif message.startswith("/sabotage"):
-
-            parts = message.split(maxsplit=1)
-
-            if len(parts) < 2:
-                target_name = input(
-                    "Enter player name to sabotage: "
-                ).strip()
-            else:
-                target_name = parts[1].strip()
-
-            send_message(conn, {
-                "Type": "Sabotage",
-                "Target": target_name,
-            })
-
-
-        # ====================================================
-        # HELP
-        # ====================================================
-
-        elif message == "/help":
-
-            log_event(f"{CYAN}{BOLD}COMMANDS{RESET}")
-            log_event("/ls — current room and players")
-            log_event("/move — move to a room")
-            log_event("/task — do your task")
-            log_event("/tasks — view tasks")
-            log_event("/whisper — private message")
-            log_event("/chat <msg> — public message")
-            log_event("/vote <name> — vote")
-            log_event("/kill <name> — Virus")
-            log_event("/inspect <name> — System Admin")
-            log_event("/revive <name> — Antivirus")
-            log_event("/tamper <name> — Rootkit")
-            log_event("/sabotage <name> — bad team")
-            log_event("/help — show commands")
-            log_event("/quit — leave")
-            ui_dirty = True
-
-
-        # ====================================================
-        # NORMAL CHAT
-        # ====================================================
-        
-        elif message.startswith("/chat "):
-            chat_msg = message[6:].strip()
-            if chat_msg:
-                send_chat(conn, chat_msg)
-
-        elif message.startswith("/start") or message.lower().strip() == "start game":
-            send_message(conn, {"Type": "StartGame"})
-
-        elif message.startswith("/"):
-            log_event(f"{RED}[ERROR] Unknown command. Type /help for a list of commands.{RESET}")
-            ui_dirty = True
-
-        else:
-            # If not a command and in Lobby or game active, try sending as chat
-            if ui_phase == "Lobby":
-                send_chat(conn, message)
-            else:
-                print("Please use a command (e.g., /chat <message> to talk). Type /help for a list of commands.")
-
+    fd = sys.stdin.fileno()
+    old_terminal_settings = termios.tcgetattr(fd)
+    input_buffer = ""
 
     try:
-        conn.close()
-    except OSError:
-        pass
+        tty.setcbreak(fd)
+
+        while True:
+            message = ""
+
+            while True:
+                if active_minigame_process is not None:
+                    while active_minigame_process is not None:
+                        time.sleep(0.1)
+                    ui_dirty = True
+
+                if ui_dirty and active_minigame_process is None:
+                    draw_hud(input_buffer)
+                    ui_dirty = False
+
+                r, _, _ = select.select([fd], [], [], 0.1)
+                if not r:
+                    continue
+
+                action, input_buffer = _read_hud_input(fd, input_buffer)
+
+                # Redraw immediately after normal typing/backspace so the
+                # command text is visible without needing another action
+                # such as scrolling.
+                if action == "none":
+                    draw_hud(input_buffer)
+                    ui_dirty = False
+                    continue
+
+                if action == "scroll_up":
+                    hud_scroll += 1
+                    draw_hud(input_buffer)
+                    continue
+
+                if action == "scroll_down":
+                    hud_scroll = max(0, hud_scroll - 1)
+                    draw_hud(input_buffer)
+                    continue
+
+                if action == "page_up":
+                    terminal_height = shutil.get_terminal_size((HUD_WIDTH + 2, 30)).lines
+                    hud_scroll += max(1, terminal_height - 4)
+                    draw_hud(input_buffer)
+                    continue
+
+                if action == "page_down":
+                    terminal_height = shutil.get_terminal_size((HUD_WIDTH + 2, 30)).lines
+                    hud_scroll = max(0, hud_scroll - max(1, terminal_height - 4))
+                    draw_hud(input_buffer)
+                    continue
+
+                if action == "quit":
+                    message = "/quit"
+                    input_buffer = ""
+                    break
+
+                if action == "enter":
+                    message = input_buffer
+                    input_buffer = ""
+                    break
+
+            # ====================================================
+            # QUIT
+            # ====================================================
+
+            if message.strip() == "/quit":
+
+                exit_hud_screen()
+                break
+
+
+            # ====================================================
+            # IGNORE EMPTY MESSAGE
+            # ====================================================
+
+            if message.strip() == "":
+                ui_dirty = True
+                continue
+
+            message = message.strip()
+
+
+            # ====================================================
+            # VOTE
+            # ====================================================
+
+            if message.startswith("/vote"):
+
+                parts = message.split(maxsplit=1)
+
+                if len(parts) < 2:
+                    target_name = _hud_text_input(
+                        "Enter player name to vote for: ", fd, old_terminal_settings
+                    ).strip()
+                else:
+                    target_name = parts[1].strip()
+
+                send_message(conn, {
+                    "Type": "Vote",
+                    "Target": target_name,
+                })
+
+
+            # ====================================================
+            # WHISPER
+            # ====================================================
+
+            elif message == "/whisper":
+                target_name = _hud_text_input(
+                    "Enter the player name: ", fd, old_terminal_settings
+                ).strip()
+
+                whisper_message = _hud_text_input(
+                    f">(Whisper to {target_name}) ", fd, old_terminal_settings
+                )
+
+                send_whisper(
+                    conn,
+                    whisper_message,
+                    target_name
+                )
+
+            elif message.startswith("/tamperedit"):
+                parts = message.split(maxsplit=3)
+                if len(parts) >= 4:
+                    target = parts[1]
+                    try:
+                        index = int(parts[2]) - 1
+                        new_room = parts[3]
+                        send_message(conn, {
+                            "Type": "TamperAction",
+                            "Action": "edit",
+                            "Target": target,
+                            "Index": index,
+                            "NewRoom": new_room,
+                        })
+                    except ValueError:
+                        print("Invalid index.")
+                else:
+                    print("Usage: /tamperedit <target> <index> <new_room>")
+
+            elif message.startswith("/tamperadd"):
+                parts = message.split(maxsplit=3)
+                if len(parts) >= 4:
+                    target = parts[1]
+                    new_room = parts[2]
+                    timestamp = parts[3]
+                    send_message(conn, {
+                        "Type": "TamperAction",
+                        "Action": "add",
+                        "Target": target,
+                        "Room": new_room,
+                        "Timestamp": timestamp,
+                    })
+                else:
+                    print("Usage: /tamperadd <target> <room> <HH:MM:SS>")
+
+            # ====================================================
+            # ROOM MOVEMENT
+            # ====================================================
+
+            elif message == "/move":
+                room_name = _hud_text_input(
+                    "Enter the folder you want to move into: ", fd, old_terminal_settings
+                ).strip()
+
+                send_move_message(
+                    conn,
+                    room_name
+                )
+
+
+            # ====================================================
+            # TASK
+            # ====================================================
+
+            elif message == "/task":
+
+                send_message(conn, {
+                    "Type": "TaskRequest",
+                })
+
+
+            # ====================================================
+            # LS (Room Info)
+            # ====================================================
+
+            elif message == "/ls":
+
+                send_message(conn, {
+                    "Type": "Ls",
+                })
+
+
+            # ====================================================
+            # VIEW TASKS
+            # ====================================================
+
+            elif message == "/tasks":
+
+                send_message(conn, {
+                    "Type": "ViewTasks",
+                })
+
+
+            # ====================================================
+            # KILL (Virus)
+            # ====================================================
+
+            elif message.startswith("/kill"):
+
+                parts = message.split(maxsplit=1)
+
+                if len(parts) < 2:
+                    target_name = _hud_text_input(
+                        "Enter target name: "
+                    ).strip()
+                else:
+                    target_name = parts[1].strip()
+
+                send_message(conn, {
+                    "Type": "Kill",
+                    "Target": target_name,
+                })
+
+
+            # ====================================================
+            # INSPECT (System Admin)
+            # ====================================================
+
+            elif message.startswith("/inspect"):
+
+                parts = message.split(maxsplit=1)
+
+                if len(parts) < 2:
+                    target_name = _hud_text_input(
+                        "Enter player name to inspect: "
+                    ).strip()
+                else:
+                    target_name = parts[1].strip()
+
+                send_message(conn, {
+                    "Type": "Inspect",
+                    "Target": target_name,
+                })
+
+
+            # ====================================================
+            # REVIVE (Antivirus)
+            # ====================================================
+
+            elif message.startswith("/revive"):
+
+                parts = message.split(maxsplit=1)
+
+                if len(parts) < 2:
+                    target_name = _hud_text_input(
+                        "Enter player name to revive: "
+                    ).strip()
+                else:
+                    target_name = parts[1].strip()
+
+                send_message(conn, {
+                    "Type": "Revive",
+                    "Target": target_name,
+                })
+
+
+            # ====================================================
+            # TAMPER (Rootkit)
+            # ====================================================
+
+            elif message.startswith("/tamper"):
+
+                parts = message.split(maxsplit=1)
+
+                if len(parts) < 2:
+                    target_name = _hud_text_input(
+                        "Enter player name to tamper: "
+                    ).strip()
+                else:
+                    target_name = parts[1].strip()
+
+                send_message(conn, {
+                    "Type": "Tamper",
+                    "Target": target_name,
+                })
+
+
+            # ====================================================
+            # SABOTAGE (Bad team)
+            # ====================================================
+
+            elif message.startswith("/sabotage"):
+
+                parts = message.split(maxsplit=1)
+
+                if len(parts) < 2:
+                    target_name = _hud_text_input(
+                        "Enter player name to sabotage: "
+                    ).strip()
+                else:
+                    target_name = parts[1].strip()
+
+                send_message(conn, {
+                    "Type": "Sabotage",
+                    "Target": target_name,
+                })
+
+
+            # ====================================================
+            # HELP
+            # ====================================================
+
+            elif message == "/help":
+
+                log_event(f"{CYAN}{BOLD}COMMANDS{RESET}")
+                log_event("/ls — current room and players")
+                log_event("/move — move to a room")
+                log_event("/task — do your task")
+                log_event("/tasks — view tasks")
+                log_event("/whisper — private message")
+                log_event("/chat <msg> — public message")
+                log_event("/vote <name> — vote")
+                log_event("/kill <name> — Virus")
+                log_event("/inspect <name> — System Admin")
+                log_event("/revive <name> — Antivirus")
+                log_event("/tamper <name> — Rootkit")
+                log_event("/sabotage <name> — bad team")
+                log_event("/help — show commands")
+                log_event("/quit — leave")
+                ui_dirty = True
+
+
+            # ====================================================
+            # NORMAL CHAT
+            # ====================================================
+
+            elif message.startswith("/chat "):
+                chat_msg = message[6:].strip()
+                if chat_msg:
+                    send_chat(conn, chat_msg)
+
+            elif message.startswith("/start") or message.lower().strip() == "start game":
+                send_message(conn, {"Type": "StartGame"})
+
+            elif message.startswith("/"):
+                log_event(f"{RED}[ERROR] Unknown command. Type /help for a list of commands.{RESET}")
+                ui_dirty = True
+
+            else:
+                # If not a command and in Lobby or game active, try sending as chat
+                if ui_phase == "Lobby":
+                    send_chat(conn, message)
+                else:
+                    print("Please use a command (e.g., /chat <message> to talk). Type /help for a list of commands.")
+
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_terminal_settings)
+        exit_hud_screen()
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 
 # ============================================================
@@ -4105,7 +4219,7 @@ def client_game(conn, name):
     global client_conn, client_name
     global client_role, client_alive
     global ui_players, ui_current_room, ui_room_players
-    global ui_tasks, ui_chat_log, ui_phase, ui_day_num
+    global ui_tasks, ui_chat_log, ui_phase, ui_day_num, hud_scroll
 
     client_conn = conn
     client_name = name
@@ -4120,6 +4234,7 @@ def client_game(conn, name):
     ui_chat_log = []
     ui_phase = "Lobby"
     ui_day_num = 0
+    hud_scroll = 0
 
     # ========================================================
     # TELL SERVER WHO WE ARE
